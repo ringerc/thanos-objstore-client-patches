@@ -44,6 +44,18 @@ var DefaultConfig = Config{
 	},
 }
 
+// Azure storage account type (blob or datalake). Normally autodetected.
+type AzStorageAccountType string
+
+const (
+	// Autodiscover storage account type. Default.
+	AzStorageAccountType_Unset AzStorageAccountType = ""
+	// Azure Blob Storage (generation 1) account type.
+	AzStorageAccountType_Blob AzStorageAccountType = "blob"
+	// Azure Data Lake Storage (generation 2) account type.
+	AzStorageAccountType_DataLake AzStorageAccountType = "datalake"
+)
+
 // Config Azure storage configuration.
 type Config struct {
 	AzTenantID              string             `yaml:"az_tenant_id"`
@@ -64,8 +76,9 @@ type Config struct {
 	// Deprecated: Is automatically set by the Azure SDK.
 	MSIResource string `yaml:"msi_resource"`
 
-	// IsAzureDataLakeGen2 indicates whether the provided storage account is an Azure Data Lake Gen2 account.
-	IsAzureDataLakeGen2 bool `yaml:"is_azure_data_lake_gen2"`
+	// Azure Storage Account type - blob (gen1) for Azure Blob Storage, or datalake (gen2)
+	// for Azure Data Lake Storage. Autodetected if not set.
+	StorageAccountType AzStorageAccountType `yaml:"azure_storage_account_type"`
 }
 
 type ReaderConfig struct {
@@ -178,9 +191,23 @@ func NewBucketWithConfig(logger log.Logger, conf Config, component string, wrapR
 		return nil, err
 	}
 
-	if conf.IsAzureDataLakeGen2 {
-		level.Debug(logger).Log("msg", "using azure data lake gen 2 storage")
+	if conf.StorageAccountType == AzStorageAccountType_Unset {
+		level.Info(logger).Log("msg", "azure_storage_account_type not set, attempting to autodetect storage account type")
+		// Autodetect the storage account type by connecting with the gen1 (azblob) sdk and
+		// querying the account properties.
+		var err error
+		conf.StorageAccountType, err = autodiscoverStorageAccountType(logger, conf, component, wrapRoundtripper)
+		if err != nil {
+			return nil, errors.Wrap(err, "when auto-discovering Azure Storage account type")
+		}
+	}
+
+	switch conf.StorageAccountType {
+	case AzStorageAccountType_DataLake:
+		level.Debug(logger).Log("msg", "using azure data lake gen 2 storage (azdatalake)")
 		return NewDataLakeGen2Bucket(logger, conf, component, wrapRoundtripper)
+	case AzStorageAccountType_Blob:
+		// Continue to create a gen1 client
 	}
 
 	containerClient, err := getContainerClient(conf, wrapRoundtripper)
@@ -407,6 +434,43 @@ func (b *Bucket) Delete(ctx context.Context, name string) error {
 // Name returns Azure container name.
 func (b *Bucket) Name() string {
 	return b.containerName
+}
+
+// If the Azure Storage Account type is not known, we use the gen1 (azblob) SDK to query the account properties
+// then discard the client. If the account supports hierarchical namespaces, it is a Data Lake Gen2 account.
+func autodiscoverStorageAccountType(logger log.Logger, conf Config, component string, wrapRoundtripper func(http.RoundTripper) http.RoundTripper) (AzStorageAccountType, error) {
+	containerClient, err := getContainerClient(conf, wrapRoundtripper)
+	if err != nil {
+		return AzStorageAccountType_Unset, err
+	}
+
+	ctx := context.Background()
+	accountProps, err := containerClient.GetAccountInfo(ctx, nil)
+	if err != nil {
+		return AzStorageAccountType_Unset, errors.Wrapf(err, "error autodiscovering Azure storage account type for account: %s", conf.StorageAccountName)
+	}
+
+	// See https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/sdk/storage/azblob@v1.6.3/container#AccountKind
+	// for possible ContainerClientGetAccountInfoResponse.AccountKind values.
+	// There is also ContainerClientGetAccountInfoResponse.IsHierarchicalNamespaceEnabled
+
+	// TODO it is unclear how AccountKind.AccountKindStorage vs AccountKindStorageV2 maps to hierarchical namespace support.
+
+	if accountProps.AccountKind == nil {
+		level.Warn(logger).Log("msg", "unable to autodiscover Azure storage account type: AccountKind is nil; assuming gen1 blob", "account", conf.StorageAccountName)
+		return AzStorageAccountType_Blob, nil
+	}
+	switch *accountProps.AccountKind {
+	case container.AccountKindStorageV2:
+		level.Info(logger).Log("msg", "autodiscovered Azure Data Lake Storage Gen2 account type", "account", conf.StorageAccountName)
+		return AzStorageAccountType_DataLake, nil
+	case container.AccountKindStorage:
+		level.Info(logger).Log("msg", "autodiscovered Azure Blob Storage account type", "account", conf.StorageAccountName)
+		return AzStorageAccountType_Blob, nil
+	default:
+		level.Warn(logger).Log("msg", "unable to autodiscover Azure storage account type: unrecognized AccountKind; assuming gen1 blob", "account", conf.StorageAccountName, "account_kind", *accountProps.AccountKind)
+		return AzStorageAccountType_Blob, nil
+	}
 }
 
 // NewTestBucket creates test bkt client that before returning creates temporary bucket.
